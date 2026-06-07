@@ -37,11 +37,18 @@
 #include <sys/sysctl.h>
 #include <sys/ucred.h>
 #include <sys/priv.h>
+#include <sys/proc.h>
+#include <sys/systm.h>
+#include <sys/time.h>
 
 #include <security/mac/mac_policy.h>
 
 static int	autodo_enabled = 1;
 static int	autodo_gid = 0;
+static int	autodo_log_grants = 0;
+static unsigned long autodo_grant_count = 0;
+
+static struct timeval autodo_log_lasttime;
 
 SYSCTL_NODE(_security_mac, OID_AUTO, autodo, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
     "mac_autodo policy controls");
@@ -53,6 +60,14 @@ SYSCTL_INT(_security_mac_autodo, OID_AUTO, enabled,
 SYSCTL_INT(_security_mac_autodo, OID_AUTO, gid,
     CTLFLAG_RW | CTLFLAG_MPSAFE, &autodo_gid, 0,
     "GID whose members receive implicit privileges (default: 0/wheel)");
+
+SYSCTL_INT(_security_mac_autodo, OID_AUTO, log_grants,
+    CTLFLAG_RW | CTLFLAG_MPSAFE, &autodo_log_grants, 0,
+    "Log privilege grants to kernel message buffer (rate-limited)");
+
+SYSCTL_ULONG(_security_mac_autodo, OID_AUTO, grant_count,
+    CTLFLAG_RD | CTLFLAG_MPSAFE, &autodo_grant_count, 0,
+    "Total number of privileges granted (read-only)");
 
 /*
  * Check if the credential includes the authorized GID in any position:
@@ -86,10 +101,17 @@ autodo_priv_grant(struct ucred *cred, int priv)
 	if (!autodo_enabled)
 		return (EPERM);
 
-	if (autodo_cred_has_gid(cred, (gid_t)autodo_gid))
-		return (0);
+	if (!autodo_cred_has_gid(cred, (gid_t)autodo_gid))
+		return (EPERM);
 
-	return (EPERM);
+	atomic_add_long(&autodo_grant_count, 1);
+
+	if (autodo_log_grants &&
+	    ratecheck(&autodo_log_lasttime, &(struct timeval){1, 0}))
+		printf("mac_autodo: grant priv %d to uid %u (pid %d, %s)\n",
+		    priv, cred->cr_uid, curproc->p_pid, curproc->p_comm);
+
+	return (0);
 }
 
 static struct mac_policy_ops autodo_ops = {

@@ -40,6 +40,10 @@
 #include <sys/proc.h>
 #include <sys/systm.h>
 #include <sys/time.h>
+#include <sys/jail.h>
+#include <sys/osd.h>
+#include <sys/mount.h>
+#include <sys/sx.h>
 
 #include <security/mac/mac_policy.h>
 
@@ -49,6 +53,7 @@ static int	autodo_log_grants = 0;
 static unsigned long autodo_grant_count = 0;
 
 static struct timeval autodo_log_lasttime;
+static unsigned	autodo_osd_jail_slot;
 
 SYSCTL_NODE(_security_mac, OID_AUTO, autodo, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
     "mac_autodo policy controls");
@@ -68,6 +73,130 @@ SYSCTL_INT(_security_mac_autodo, OID_AUTO, log_grants,
 SYSCTL_ULONG(_security_mac_autodo, OID_AUTO, grant_count,
     CTLFLAG_RD | CTLFLAG_MPSAFE, &autodo_grant_count, 0,
     "Total number of privileges granted (read-only)");
+
+SYSCTL_JAIL_PARAM_SYS_SUBNODE(mac, autodo, CTLFLAG_RW,
+    "Jail MAC/autodo parameters");
+
+/*
+ * Per-jail OSD stores the jail's autodo mode as an intptr_t:
+ *   0 (JAIL_SYS_DISABLE) - disabled in this jail
+ *   1 (JAIL_SYS_NEW)     - enabled in this jail
+ *   2 (JAIL_SYS_INHERIT) - inherit from parent jail
+ *
+ * We encode the mode +1 in the OSD pointer to distinguish "no OSD set"
+ * (NULL) from "explicitly disabled" (value 1).  Decoding: mode = ptr - 1.
+ */
+#define	AUTODO_OSD_ENCODE(mode)	((void *)((intptr_t)(mode) + 1))
+#define	AUTODO_OSD_DECODE(ptr)	((int)((intptr_t)(ptr) - 1))
+
+static void
+autodo_osd_jail_destructor(void *value __unused)
+{
+	/* Nothing to free — we store encoded integers, not pointers. */
+}
+
+static int
+autodo_jail_create(void *obj, void *data __unused)
+{
+	struct prison *pr = obj;
+
+	/* New jails default to disabled. */
+	osd_jail_set(pr, autodo_osd_jail_slot,
+	    AUTODO_OSD_ENCODE(JAIL_SYS_DISABLE));
+	return (0);
+}
+
+static int
+autodo_jail_get(void *obj, void *data)
+{
+	struct prison *pr = obj;
+	struct vfsoptlist *opts = data;
+	void *osd_val;
+	int jsys, error;
+
+	osd_val = osd_jail_get(pr, autodo_osd_jail_slot);
+	if (osd_val == NULL)
+		jsys = JAIL_SYS_DISABLE;
+	else
+		jsys = AUTODO_OSD_DECODE(osd_val);
+
+	error = vfs_setopt(opts, "mac.autodo", &jsys, sizeof(jsys));
+	if (error != 0 && error != ENOENT)
+		return (error);
+	return (0);
+}
+
+static int
+autodo_jail_check(void *obj __unused, void *data)
+{
+	struct vfsoptlist *opts = data;
+	int error, jsys;
+
+	error = vfs_copyopt(opts, "mac.autodo", &jsys, sizeof(jsys));
+	if (error == ENOENT)
+		return (0);
+	if (error != 0)
+		return (error);
+	if (jsys != JAIL_SYS_DISABLE && jsys != JAIL_SYS_NEW &&
+	    jsys != JAIL_SYS_INHERIT)
+		return (EINVAL);
+	return (0);
+}
+
+static int
+autodo_jail_set(void *obj, void *data)
+{
+	struct prison *pr = obj;
+	struct vfsoptlist *opts = data;
+	int error, jsys;
+
+	error = vfs_copyopt(opts, "mac.autodo", &jsys, sizeof(jsys));
+	if (error == ENOENT)
+		return (0);
+	if (error != 0)
+		return (error);
+
+	osd_jail_set(pr, autodo_osd_jail_slot,
+	    AUTODO_OSD_ENCODE(jsys));
+	return (0);
+}
+
+static const osd_method_t autodo_osd_methods[PR_MAXMETHOD] = {
+	[PR_METHOD_CREATE] = autodo_jail_create,
+	[PR_METHOD_GET] = autodo_jail_get,
+	[PR_METHOD_CHECK] = autodo_jail_check,
+	[PR_METHOD_SET] = autodo_jail_set,
+};
+
+/*
+ * Check if autodo is enabled for the given prison.
+ * Walks up the jail hierarchy for JAIL_SYS_INHERIT.
+ * Returns 1 if enabled, 0 if disabled.
+ */
+static int
+autodo_jail_enabled(struct prison *pr)
+{
+	void *osd_val;
+	int jsys;
+
+	for (; pr != NULL; pr = pr->pr_parent) {
+		osd_val = osd_jail_get(pr, autodo_osd_jail_slot);
+		if (osd_val == NULL)
+			return (0);
+		jsys = AUTODO_OSD_DECODE(osd_val);
+		switch (jsys) {
+		case JAIL_SYS_NEW:
+			return (1);
+		case JAIL_SYS_DISABLE:
+			return (0);
+		case JAIL_SYS_INHERIT:
+			continue;
+		default:
+			return (0);
+		}
+	}
+	return (0);
+}
 
 /*
  * Check if the credential includes the authorized GID in any position:
@@ -97,11 +226,21 @@ autodo_cred_has_gid(struct ucred *cred, gid_t gid)
 static int
 autodo_priv_grant(struct ucred *cred, int priv)
 {
+	struct prison *pr;
 
 	if (!autodo_enabled)
 		return (EPERM);
 
 	if (!autodo_cred_has_gid(cred, (gid_t)autodo_gid))
+		return (EPERM);
+
+	/*
+	 * Check jail policy.  The host (prison0) is always governed by
+	 * the global 'enabled' sysctl above.  For jails, check per-jail
+	 * OSD configuration.
+	 */
+	pr = cred->cr_prison;
+	if (pr != &prison0 && !autodo_jail_enabled(pr))
 		return (EPERM);
 
 	atomic_add_long(&autodo_grant_count, 1);
@@ -114,7 +253,37 @@ autodo_priv_grant(struct ucred *cred, int priv)
 	return (0);
 }
 
+static void
+autodo_init(struct mac_policy_conf *mpc __unused)
+{
+	struct prison *pr;
+
+	autodo_osd_jail_slot = osd_jail_register(
+	    autodo_osd_jail_destructor, autodo_osd_methods);
+
+	/* Set host jail (prison0) to enabled. */
+	osd_jail_set(&prison0, autodo_osd_jail_slot,
+	    AUTODO_OSD_ENCODE(JAIL_SYS_NEW));
+
+	/* Set all existing jails to disabled. */
+	sx_slock(&allprison_lock);
+	TAILQ_FOREACH(pr, &allprison, pr_list) {
+		osd_jail_set(pr, autodo_osd_jail_slot,
+		    AUTODO_OSD_ENCODE(JAIL_SYS_DISABLE));
+	}
+	sx_sunlock(&allprison_lock);
+}
+
+static void
+autodo_destroy(struct mac_policy_conf *mpc __unused)
+{
+
+	osd_jail_deregister(autodo_osd_jail_slot);
+}
+
 static struct mac_policy_ops autodo_ops = {
+	.mpo_init = autodo_init,
+	.mpo_destroy = autodo_destroy,
 	.mpo_priv_grant = autodo_priv_grant,
 };
 

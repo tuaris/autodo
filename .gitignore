@@ -1,0 +1,10 @@
+*.o
+*.ko
+*.ko.debug
+*.kld
+.depend.*
+export_syms
+machine
+x86
+i386
+opt_global.h

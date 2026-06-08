@@ -1,0 +1,10 @@
+syntax(2)
+
+test_suite('mac_autodo')
+
+atf_test_program{name='kern_basic_test.sh'}
+atf_test_program{name='kern_scope_test.sh'}
+atf_test_program{name='kern_jail_test.sh'}
+atf_test_program{name='kern_policy_test.sh'}
+atf_test_program{name='kern_stress_test.sh'}
+atf_test_program{name='kern_negative_test.sh'}

@@ -485,9 +485,13 @@ fn makeKevent(ident: usize, filter: c_short, flags: c_ushort, fflags: c_uint) KE
 
 fn applyConfig(dev_fd: posix.fd_t, cfg: *const Config) void {
     if (!cfg.enabled) {
-        // Disabled: push empty policy (clears all grants)
+        // Disabled: push a policy with one entry (GID 0, empty bitmap).
+        // This activates multi-group mode with zero permissions,
+        // ensuring no privileges are granted to anyone.
         var policy = std.mem.zeroes(AutodoPolicy);
-        policy.ap_count = 0;
+        policy.ap_count = 1;
+        policy.ap_entries[0].ape_gid = 0;
+        // bitmap is already all-zero from zeroes()
         pushPolicy(dev_fd, &policy) catch {
             // Fallback to legacy empty scope
             var scope = AutodoScope{ .as_bitmap = [_]u64{0} ** AUTODO_BITMAP_WORDS };

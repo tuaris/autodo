@@ -172,9 +172,85 @@ echo "[10] Character device (/dev/autodo)"
 assert_success "test -c /dev/autodo" "/dev/autodo exists"
 assert_success "test -r /dev/autodo" "/dev/autodo readable by wheel"
 
+# --- Test: Multi-group policy via daemon ---
+echo ""
+echo "[11] Multi-group policy"
+DAEMON_PATH="${DAEMON_PATH:-$(dirname "$0")/../daemon/zig-out/bin/autodo-eventd}"
+TEMPLATE_DIR="$(dirname "$0")/../config/templates"
+if [ -x "$DAEMON_PATH" ] && [ -d "$TEMPLATE_DIR" ]; then
+	# Restore scope to all before daemon test
+	doas sysctl security.mac.autodo.scope=all >/dev/null
+
+	# Create temp config with groups block
+	TMPCONF=$(mktemp /tmp/autodo-test-XXXXXX.conf)
+	TMPLOG=$(mktemp /tmp/autodo-test-log-XXXXXX.json)
+	cat > "$TMPCONF" <<-TESTCONF
+	enabled = true;
+	groups {
+	    wheel {
+	        template = "all";
+	    }
+	}
+	audit {
+	    enabled = true;
+	    log_file = "${TMPLOG}";
+	}
+	template_dir = "${TEMPLATE_DIR}";
+	TESTCONF
+
+	# Run daemon briefly to push policy
+	doas "$DAEMON_PATH" --config="$TMPCONF" &
+	sleep 1
+
+	# With multi-group policy active (wheel=all), wheel user should have full access
+	assert_success "cat $TEST_FILE" "multi-group: wheel has full access via all template"
+
+	# Kill daemon (runs as root via doas, so pkill it)
+	doas pkill -f autodo-eventd 2>/dev/null || true
+	sleep 1
+
+	# Now test with VFS-only template for wheel
+	cat > "$TMPCONF" <<-TESTCONF
+	enabled = true;
+	groups {
+	    wheel {
+	        template = "minimal";
+	    }
+	}
+	audit {
+	    enabled = false;
+	}
+	template_dir = "${TEMPLATE_DIR}";
+	TESTCONF
+
+	doas "$DAEMON_PATH" --config="$TMPCONF" &
+	sleep 1
+
+	# VFS should work
+	assert_success "cat $TEST_FILE" "multi-group: wheel has VFS access via minimal template"
+
+	# Jail operations should be denied (minimal = vfs only).
+	# Use doas for jail -m since mac_autodo minimal scope denies
+	# jail ops, but mac_do (separate module) still works via doas.
+	if [ -n "$FIRST_JAIL" ]; then
+		doas jail -m name="$FIRST_JAIL" mac.autodo=new 2>/dev/null || true
+		assert_fail "jexec $FIRST_JAIL hostname" \
+		    "multi-group: jail denied with minimal template"
+		doas jail -m name="$FIRST_JAIL" mac.autodo=disable 2>/dev/null || true
+	fi
+
+	doas pkill -f autodo-eventd 2>/dev/null || true
+	sleep 1
+
+	rm -f "$TMPCONF" "$TMPLOG"
+	pass "multi-group daemon tests completed"
+else
+	echo "  SKIP: daemon not built or templates not found"
+fi
+
 # --- Test: Module unload ---
 echo ""
-echo "[11] Module unload"
+echo "[12] Module unload"
 doas kldunload mac_autodo
 assert_success "! kldstat -q -m mac_autodo" "module unloaded"
 assert_fail "cat $TEST_FILE" "access denied after unload"

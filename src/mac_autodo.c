@@ -44,8 +44,230 @@
 #include <sys/osd.h>
 #include <sys/mount.h>
 #include <sys/sx.h>
+#include <sys/conf.h>
+#include <sys/ioccom.h>
+#include <sys/malloc.h>
 
 #include <security/mac/mac_policy.h>
+
+/*
+ * Privilege scope bitmap.
+ *
+ * _PRIV_HIGHEST is 703, so we need ceil(703/64) = 11 uint64_t words.
+ * A set bit means the privilege IS granted.  Default: all bits set ("all").
+ */
+#define	AUTODO_BITMAP_WORDS	11
+#define	AUTODO_BITMAP_BITS	(AUTODO_BITMAP_WORDS * 64)
+
+static volatile uint64_t autodo_scope_bitmap[AUTODO_BITMAP_WORDS];
+
+static inline int
+autodo_priv_in_scope(int priv)
+{
+	unsigned word, bit;
+
+	if (priv <= 0 || priv >= AUTODO_BITMAP_BITS)
+		return (0);
+	word = (unsigned)priv / 64;
+	bit = (unsigned)priv % 64;
+	return ((autodo_scope_bitmap[word] >> bit) & 1);
+}
+
+static inline void
+autodo_bitmap_set(volatile uint64_t *bitmap, int priv)
+{
+	unsigned word, bit;
+
+	if (priv <= 0 || priv >= AUTODO_BITMAP_BITS)
+		return;
+	word = (unsigned)priv / 64;
+	bit = (unsigned)priv % 64;
+	bitmap[word] |= (1UL << bit);
+}
+
+static inline void
+autodo_bitmap_clear(volatile uint64_t *bitmap, int priv)
+{
+	unsigned word, bit;
+
+	if (priv <= 0 || priv >= AUTODO_BITMAP_BITS)
+		return;
+	word = (unsigned)priv / 64;
+	bit = (unsigned)priv % 64;
+	bitmap[word] &= ~(1UL << bit);
+}
+
+static void
+autodo_bitmap_fill(volatile uint64_t *bitmap)
+{
+	int i;
+
+	for (i = 0; i < AUTODO_BITMAP_WORDS; i++)
+		bitmap[i] = ~0UL;
+}
+
+/*
+ * Privilege categories for the 'scope' sysctl.
+ * Each category maps to a range of priv(9) constants.
+ */
+#define	AUTODO_CAT_SYSTEM	0x0001
+#define	AUTODO_CAT_AUDIT	0x0002
+#define	AUTODO_CAT_CRED		0x0004
+#define	AUTODO_CAT_DEBUG	0x0008
+#define	AUTODO_CAT_JAIL		0x0010
+#define	AUTODO_CAT_KLD		0x0020
+#define	AUTODO_CAT_PROC		0x0040
+#define	AUTODO_CAT_VFS		0x0080
+#define	AUTODO_CAT_VM		0x0100
+#define	AUTODO_CAT_DEV		0x0200
+#define	AUTODO_CAT_NET		0x0400
+#define	AUTODO_CAT_MISC		0x0800
+#define	AUTODO_CAT_ALL		0x0FFF
+
+struct autodo_priv_range {
+	int	start;
+	int	end;	/* inclusive */
+};
+
+static const struct autodo_priv_range autodo_cat_ranges[] = {
+	[0]  = { 2, 18 },	/* SYSTEM: ACCT..SETTIMEOFDAY */
+	[1]  = { 40, 44 },	/* AUDIT */
+	[2]  = { 50, 62 },	/* CRED */
+	[3]  = { 80, 92 },	/* DEBUG + DTRACE */
+	[4]  = { 110, 112 },	/* JAIL */
+	[5]  = { 130, 141 },	/* KLD + MAC */
+	[6]  = { 160, 242 },	/* PROC: PROC,IPC,MQ,PMC,SCHED,SEM,SIGNAL,SYSCTL */
+	[7]  = { 310, 345 },	/* VFS */
+	[8]  = { 360, 364 },	/* VM */
+	[9]  = { 370, 380 },	/* DEV: DEVFS,RANDOM */
+	[10] = { 390, 540 },	/* NET: all networking */
+	[11] = { 550, 702 },	/* MISC: MODULE,KMEM,RCTL,VERIEXEC,etc */
+};
+
+#define	AUTODO_NUM_CATS	(sizeof(autodo_cat_ranges) / sizeof(autodo_cat_ranges[0]))
+
+/*
+ * Rebuild the scope bitmap from a category bitmask.
+ */
+static void
+autodo_rebuild_bitmap(uint32_t cats)
+{
+	int i, p;
+
+	/* Start with empty bitmap. */
+	for (i = 0; i < AUTODO_BITMAP_WORDS; i++)
+		autodo_scope_bitmap[i] = 0;
+
+	if (cats == AUTODO_CAT_ALL) {
+		autodo_bitmap_fill(autodo_scope_bitmap);
+		return;
+	}
+
+	for (i = 0; i < (int)AUTODO_NUM_CATS; i++) {
+		if (!(cats & (1U << i)))
+			continue;
+		for (p = autodo_cat_ranges[i].start;
+		    p <= autodo_cat_ranges[i].end; p++)
+			autodo_bitmap_set(autodo_scope_bitmap, p);
+	}
+}
+
+static uint32_t	autodo_scope_cats = AUTODO_CAT_ALL;
+
+/*
+ * Sysctl handler for 'scope' — accepts comma-separated category names or "all".
+ */
+static int
+autodo_sysctl_scope(SYSCTL_HANDLER_ARGS)
+{
+	char buf[128];
+	uint32_t new_cats;
+	int error;
+	char *p, *token;
+
+	/* Build current string representation for reading. */
+	if (autodo_scope_cats == AUTODO_CAT_ALL)
+		strlcpy(buf, "all", sizeof(buf));
+	else {
+		buf[0] = '\0';
+		if (autodo_scope_cats & AUTODO_CAT_SYSTEM)
+			strlcat(buf, "system,", sizeof(buf));
+		if (autodo_scope_cats & AUTODO_CAT_AUDIT)
+			strlcat(buf, "audit,", sizeof(buf));
+		if (autodo_scope_cats & AUTODO_CAT_CRED)
+			strlcat(buf, "cred,", sizeof(buf));
+		if (autodo_scope_cats & AUTODO_CAT_DEBUG)
+			strlcat(buf, "debug,", sizeof(buf));
+		if (autodo_scope_cats & AUTODO_CAT_JAIL)
+			strlcat(buf, "jail,", sizeof(buf));
+		if (autodo_scope_cats & AUTODO_CAT_KLD)
+			strlcat(buf, "kld,", sizeof(buf));
+		if (autodo_scope_cats & AUTODO_CAT_PROC)
+			strlcat(buf, "proc,", sizeof(buf));
+		if (autodo_scope_cats & AUTODO_CAT_VFS)
+			strlcat(buf, "vfs,", sizeof(buf));
+		if (autodo_scope_cats & AUTODO_CAT_VM)
+			strlcat(buf, "vm,", sizeof(buf));
+		if (autodo_scope_cats & AUTODO_CAT_DEV)
+			strlcat(buf, "dev,", sizeof(buf));
+		if (autodo_scope_cats & AUTODO_CAT_NET)
+			strlcat(buf, "net,", sizeof(buf));
+		if (autodo_scope_cats & AUTODO_CAT_MISC)
+			strlcat(buf, "misc,", sizeof(buf));
+		/* Remove trailing comma. */
+		p = buf + strlen(buf) - 1;
+		if (p >= buf && *p == ',')
+			*p = '\0';
+	}
+
+	error = sysctl_handle_string(oidp, buf, sizeof(buf), req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+
+	/* Parse new value. */
+	if (strcmp(buf, "all") == 0) {
+		new_cats = AUTODO_CAT_ALL;
+	} else {
+		new_cats = 0;
+		p = buf;
+		while ((token = strsep(&p, ",")) != NULL) {
+			if (*token == '\0')
+				continue;
+			if (strcmp(token, "system") == 0)
+				new_cats |= AUTODO_CAT_SYSTEM;
+			else if (strcmp(token, "audit") == 0)
+				new_cats |= AUTODO_CAT_AUDIT;
+			else if (strcmp(token, "cred") == 0)
+				new_cats |= AUTODO_CAT_CRED;
+			else if (strcmp(token, "debug") == 0)
+				new_cats |= AUTODO_CAT_DEBUG;
+			else if (strcmp(token, "jail") == 0)
+				new_cats |= AUTODO_CAT_JAIL;
+			else if (strcmp(token, "kld") == 0)
+				new_cats |= AUTODO_CAT_KLD;
+			else if (strcmp(token, "proc") == 0)
+				new_cats |= AUTODO_CAT_PROC;
+			else if (strcmp(token, "vfs") == 0)
+				new_cats |= AUTODO_CAT_VFS;
+			else if (strcmp(token, "vm") == 0)
+				new_cats |= AUTODO_CAT_VM;
+			else if (strcmp(token, "dev") == 0)
+				new_cats |= AUTODO_CAT_DEV;
+			else if (strcmp(token, "net") == 0)
+				new_cats |= AUTODO_CAT_NET;
+			else if (strcmp(token, "misc") == 0)
+				new_cats |= AUTODO_CAT_MISC;
+			else
+				return (EINVAL);
+		}
+		if (new_cats == 0)
+			return (EINVAL);
+	}
+
+	autodo_scope_cats = new_cats;
+	autodo_rebuild_bitmap(new_cats);
+	return (0);
+}
 
 static int	autodo_enabled = 1;
 static int	autodo_gid = 0;
@@ -73,6 +295,11 @@ SYSCTL_INT(_security_mac_autodo, OID_AUTO, log_grants,
 SYSCTL_ULONG(_security_mac_autodo, OID_AUTO, grant_count,
     CTLFLAG_RD | CTLFLAG_MPSAFE, &autodo_grant_count, 0,
     "Total number of privileges granted (read-only)");
+
+SYSCTL_PROC(_security_mac_autodo, OID_AUTO, scope,
+    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, 0,
+    autodo_sysctl_scope, "A",
+    "Privilege scope: comma-separated categories or 'all' (default: all)");
 
 SYSCTL_JAIL_PARAM_SYS_SUBNODE(mac, autodo, CTLFLAG_RW,
     "Jail MAC/autodo parameters");
@@ -235,6 +462,13 @@ autodo_priv_grant(struct ucred *cred, int priv)
 		return (EPERM);
 
 	/*
+	 * Check privilege scope bitmap.  If the privilege is not in the
+	 * configured scope, deny it regardless of group membership.
+	 */
+	if (!autodo_priv_in_scope(priv))
+		return (EPERM);
+
+	/*
 	 * Check jail policy.  The host (prison0) is always governed by
 	 * the global 'enabled' sysctl above.  For jails, check per-jail
 	 * OSD configuration.
@@ -257,6 +491,9 @@ static void
 autodo_init(struct mac_policy_conf *mpc __unused)
 {
 	struct prison *pr;
+
+	/* Initialize scope bitmap to "all" (default). */
+	autodo_bitmap_fill(autodo_scope_bitmap);
 
 	autodo_osd_jail_slot = osd_jail_register(
 	    autodo_osd_jail_destructor, autodo_osd_methods);

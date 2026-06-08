@@ -141,9 +141,34 @@ else
 	echo "  SKIP: no jails running"
 fi
 
+# --- Test: Privilege scoping ---
+echo ""
+echo "[9] Privilege scoping"
+assert_success "sysctl security.mac.autodo.scope" "scope sysctl readable"
+
+# Restrict to VFS only
+sysctl security.mac.autodo.scope=vfs >/dev/null
+assert_success "cat $TEST_FILE" "VFS access works with scope=vfs"
+assert_fail "jexec $FIRST_JAIL hostname" "jexec denied with scope=vfs (needs jail category)"
+
+# Add jail category
+doas sysctl security.mac.autodo.scope=vfs,jail >/dev/null
+assert_success "jexec $FIRST_JAIL hostname" "jexec works with scope=vfs,jail"
+
+# Invalid category rejected
+if sysctl security.mac.autodo.scope=bogus >/dev/null 2>&1; then
+	fail "invalid category 'bogus' should be rejected"
+else
+	pass "invalid category rejected with error"
+fi
+
+# Restore to all
+doas sysctl security.mac.autodo.scope=all >/dev/null
+assert_success "cat $TEST_FILE" "full access restored with scope=all"
+
 # --- Test: Module unload ---
 echo ""
-echo "[9] Module unload"
+echo "[10] Module unload"
 doas kldunload mac_autodo
 assert_success "! kldstat -q -m mac_autodo" "module unloaded"
 assert_fail "cat $TEST_FILE" "access denied after unload"

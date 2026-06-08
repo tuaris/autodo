@@ -47,8 +47,15 @@
 #include <sys/conf.h>
 #include <sys/ioccom.h>
 #include <sys/malloc.h>
+#include <sys/uio.h>
+#include <sys/poll.h>
+#include <sys/selinfo.h>
+#include <sys/filio.h>
+#include <sys/event.h>
 
 #include <security/mac/mac_policy.h>
+
+#include "autodo.h"
 
 /*
  * Privilege scope bitmap.
@@ -56,7 +63,6 @@
  * _PRIV_HIGHEST is 703, so we need ceil(703/64) = 11 uint64_t words.
  * A set bit means the privilege IS granted.  Default: all bits set ("all").
  */
-#define	AUTODO_BITMAP_WORDS	11
 #define	AUTODO_BITMAP_BITS	(AUTODO_BITMAP_WORDS * 64)
 
 static volatile uint64_t autodo_scope_bitmap[AUTODO_BITMAP_WORDS];
@@ -304,6 +310,216 @@ SYSCTL_PROC(_security_mac_autodo, OID_AUTO, scope,
 SYSCTL_JAIL_PARAM_SYS_SUBNODE(mac, autodo, CTLFLAG_RW,
     "Jail MAC/autodo parameters");
 
+/* ----------------------------------------------------------------
+ * /dev/autodo character device — ring buffer + ioctl interface
+ * ---------------------------------------------------------------- */
+
+MALLOC_DEFINE(M_AUTODO, "autodo", "mac_autodo ring buffer");
+
+static struct mtx	autodo_ring_mtx;
+static struct autodo_event *autodo_ring;
+static unsigned		autodo_ring_head;	/* next write position */
+static unsigned		autodo_ring_tail;	/* next read position */
+static unsigned		autodo_ring_count;	/* events available */
+static struct selinfo	autodo_sel;
+static struct cdev	*autodo_cdev;
+static int		autodo_dev_open;	/* single-open flag */
+
+static void
+autodo_ring_push(const struct autodo_event *ev)
+{
+
+	mtx_lock(&autodo_ring_mtx);
+	if (autodo_ring == NULL) {
+		mtx_unlock(&autodo_ring_mtx);
+		return;
+	}
+	autodo_ring[autodo_ring_head] = *ev;
+	autodo_ring_head = (autodo_ring_head + 1) % AUTODO_RING_SIZE;
+	if (autodo_ring_count < AUTODO_RING_SIZE)
+		autodo_ring_count++;
+	else
+		autodo_ring_tail = (autodo_ring_tail + 1) % AUTODO_RING_SIZE;
+	wakeup(&autodo_ring_count);
+	mtx_unlock(&autodo_ring_mtx);
+	selwakeup(&autodo_sel);
+	KNOTE_UNLOCKED(&autodo_sel.si_note, 0);
+}
+
+static void
+autodo_emit_event(struct ucred *cred, int priv, int granted)
+{
+	struct autodo_event ev;
+	struct timespec ts;
+
+	nanouptime(&ts);
+	ev.ae_timestamp = (uint64_t)ts.tv_sec * 1000000000ULL +
+	    (uint64_t)ts.tv_nsec;
+	ev.ae_pid = curproc->p_pid;
+	ev.ae_uid = cred->cr_uid;
+	ev.ae_gid = cred->cr_rgid;
+	ev.ae_priv = priv;
+	ev.ae_granted = granted ? 1 : 0;
+	memset(ev.ae_pad, 0, sizeof(ev.ae_pad));
+	strlcpy(ev.ae_comm, curproc->p_comm, sizeof(ev.ae_comm));
+
+	autodo_ring_push(&ev);
+}
+
+static int
+autodo_dev_open_f(struct cdev *dev __unused, int oflags __unused,
+    int devtype __unused, struct thread *td __unused)
+{
+
+	if (atomic_cmpset_int(&autodo_dev_open, 0, 1) == 0)
+		return (EBUSY);
+	return (0);
+}
+
+static int
+autodo_dev_close_f(struct cdev *dev __unused, int fflag __unused,
+    int devtype __unused, struct thread *td __unused)
+{
+
+	autodo_dev_open = 0;
+	return (0);
+}
+
+static int
+autodo_dev_read(struct cdev *dev __unused, struct uio *uio,
+    int ioflag __unused)
+{
+	struct autodo_event ev;
+	int error;
+
+	mtx_lock(&autodo_ring_mtx);
+	while (autodo_ring_count == 0) {
+		error = msleep(&autodo_ring_count, &autodo_ring_mtx,
+		    PCATCH, "autodo", 0);
+		if (error != 0) {
+			mtx_unlock(&autodo_ring_mtx);
+			return (error);
+		}
+	}
+
+	while (uio->uio_resid >= (ssize_t)sizeof(ev) &&
+	    autodo_ring_count > 0) {
+		ev = autodo_ring[autodo_ring_tail];
+		autodo_ring_tail = (autodo_ring_tail + 1) % AUTODO_RING_SIZE;
+		autodo_ring_count--;
+		mtx_unlock(&autodo_ring_mtx);
+
+		error = uiomove(&ev, sizeof(ev), uio);
+		if (error != 0)
+			return (error);
+
+		mtx_lock(&autodo_ring_mtx);
+	}
+	mtx_unlock(&autodo_ring_mtx);
+	return (0);
+}
+
+static int
+autodo_dev_poll(struct cdev *dev __unused, int events, struct thread *td)
+{
+	int revents = 0;
+
+	mtx_lock(&autodo_ring_mtx);
+	if (events & (POLLIN | POLLRDNORM)) {
+		if (autodo_ring_count > 0)
+			revents |= events & (POLLIN | POLLRDNORM);
+		else
+			selrecord(td, &autodo_sel);
+	}
+	mtx_unlock(&autodo_ring_mtx);
+	return (revents);
+}
+
+static int
+autodo_dev_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
+    int fflag __unused, struct thread *td __unused)
+{
+	struct autodo_scope *scope;
+	int i;
+
+	switch (cmd) {
+	case AUTODO_SET_SCOPE:
+		scope = (struct autodo_scope *)data;
+		for (i = 0; i < AUTODO_BITMAP_WORDS; i++)
+			autodo_scope_bitmap[i] = scope->as_bitmap[i];
+		return (0);
+
+	case AUTODO_GET_SCOPE:
+		scope = (struct autodo_scope *)data;
+		for (i = 0; i < AUTODO_BITMAP_WORDS; i++)
+			scope->as_bitmap[i] = autodo_scope_bitmap[i];
+		return (0);
+
+	case AUTODO_FLUSH:
+		mtx_lock(&autodo_ring_mtx);
+		autodo_ring_head = 0;
+		autodo_ring_tail = 0;
+		autodo_ring_count = 0;
+		mtx_unlock(&autodo_ring_mtx);
+		return (0);
+
+	default:
+		return (ENOTTY);
+	}
+}
+
+static int	autodo_kqread(struct knote *kn, long hint);
+static void	autodo_kqdetach(struct knote *kn);
+
+static const struct filterops autodo_read_filterops = {
+	.f_isfd = true,
+	.f_attach = NULL,
+	.f_detach = autodo_kqdetach,
+	.f_event = autodo_kqread,
+};
+
+static int
+autodo_dev_kqfilter(struct cdev *dev __unused, struct knote *kn)
+{
+
+	switch (kn->kn_filter) {
+	case EVFILT_READ:
+		kn->kn_fop = &autodo_read_filterops;
+		knlist_add(&autodo_sel.si_note, kn, 0);
+		return (0);
+	default:
+		return (EINVAL);
+	}
+}
+
+static int
+autodo_kqread(struct knote *kn, long hint __unused)
+{
+
+	mtx_lock(&autodo_ring_mtx);
+	kn->kn_data = autodo_ring_count * sizeof(struct autodo_event);
+	mtx_unlock(&autodo_ring_mtx);
+	return (kn->kn_data > 0);
+}
+
+static void
+autodo_kqdetach(struct knote *kn)
+{
+
+	knlist_remove(&autodo_sel.si_note, kn, 0);
+}
+
+static struct cdevsw autodo_cdevsw = {
+	.d_version = D_VERSION,
+	.d_open = autodo_dev_open_f,
+	.d_close = autodo_dev_close_f,
+	.d_read = autodo_dev_read,
+	.d_poll = autodo_dev_poll,
+	.d_ioctl = autodo_dev_ioctl,
+	.d_kqfilter = autodo_dev_kqfilter,
+	.d_name = "autodo",
+};
+
 /*
  * Per-jail OSD stores the jail's autodo mode as an intptr_t:
  *   0 (JAIL_SYS_DISABLE) - disabled in this jail
@@ -479,10 +695,14 @@ autodo_priv_grant(struct ucred *cred, int priv)
 
 	atomic_add_long(&autodo_grant_count, 1);
 
-	if (autodo_log_grants &&
-	    ratecheck(&autodo_log_lasttime, &(struct timeval){1, 0}))
-		printf("mac_autodo: grant priv %d to uid %u (pid %d, %s)\n",
-		    priv, cred->cr_uid, curproc->p_pid, curproc->p_comm);
+	if (autodo_log_grants) {
+		autodo_emit_event(cred, priv, 1);
+		if (ratecheck(&autodo_log_lasttime, &(struct timeval){1, 0}))
+			printf("mac_autodo: grant priv %d to uid %u "
+			    "(pid %d, %s)\n",
+			    priv, cred->cr_uid, curproc->p_pid,
+			    curproc->p_comm);
+	}
 
 	return (0);
 }
@@ -494,6 +714,18 @@ autodo_init(struct mac_policy_conf *mpc __unused)
 
 	/* Initialize scope bitmap to "all" (default). */
 	autodo_bitmap_fill(autodo_scope_bitmap);
+
+	/* Initialize ring buffer and chardev. */
+	mtx_init(&autodo_ring_mtx, "autodo ring", NULL, MTX_DEF);
+	autodo_ring = malloc(sizeof(struct autodo_event) * AUTODO_RING_SIZE,
+	    M_AUTODO, M_WAITOK | M_ZERO);
+	autodo_ring_head = 0;
+	autodo_ring_tail = 0;
+	autodo_ring_count = 0;
+	autodo_dev_open = 0;
+	knlist_init_mtx(&autodo_sel.si_note, &autodo_ring_mtx);
+	autodo_cdev = make_dev(&autodo_cdevsw, 0, UID_ROOT, GID_WHEEL,
+	    0640, "autodo");
 
 	autodo_osd_jail_slot = osd_jail_register(
 	    autodo_osd_jail_destructor, autodo_osd_methods);
@@ -516,6 +748,21 @@ autodo_destroy(struct mac_policy_conf *mpc __unused)
 {
 
 	osd_jail_deregister(autodo_osd_jail_slot);
+
+	if (autodo_cdev != NULL) {
+		destroy_dev(autodo_cdev);
+		autodo_cdev = NULL;
+	}
+	seldrain(&autodo_sel);
+	knlist_destroy(&autodo_sel.si_note);
+	mtx_lock(&autodo_ring_mtx);
+	if (autodo_ring != NULL) {
+		free(autodo_ring, M_AUTODO);
+		autodo_ring = NULL;
+	}
+	autodo_ring_count = 0;
+	mtx_unlock(&autodo_ring_mtx);
+	mtx_destroy(&autodo_ring_mtx);
 }
 
 static struct mac_policy_ops autodo_ops = {

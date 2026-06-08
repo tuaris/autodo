@@ -1,0 +1,10 @@
+enabled = true;
+
+scope {
+    categories = ["all"];
+}
+
+audit {
+    enabled = true;
+    log_file = "/var/log/autodo/events.json";
+}

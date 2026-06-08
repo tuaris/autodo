@@ -1,0 +1,50 @@
+#!/bin/sh
+#
+# PROVIDE: autodo_eventd
+# REQUIRE: DAEMON
+# BEFORE: LOGIN
+# KEYWORD: shutdown
+#
+# Add the following lines to /etc/rc.conf to enable autodo_eventd:
+#
+# autodo_eventd_enable (bool):  Set to YES to enable autodo-eventd.
+#                               Default: NO
+# autodo_eventd_config (str):   Path to config file.
+#                               Default: /usr/local/etc/autodo/autodo.conf
+# autodo_eventd_logfile (str):  Path to audit log.
+#                               Default: /var/log/autodo/events.json
+#
+
+. /etc/rc.subr
+
+name=autodo_eventd
+rcvar=autodo_eventd_enable
+
+load_rc_config $name
+
+: ${autodo_eventd_enable:="NO"}
+: ${autodo_eventd_config:="/usr/local/etc/autodo/autodo.conf"}
+: ${autodo_eventd_logfile:="/var/log/autodo/events.json"}
+
+pidfile="/var/run/${name}.pid"
+command="/usr/sbin/daemon"
+command_args="-p ${pidfile} -S -T ${name} -- /usr/local/bin/autodo-eventd --config=${autodo_eventd_config} --log=${autodo_eventd_logfile}"
+
+start_precmd="${name}_prestart"
+
+autodo_eventd_prestart()
+{
+	local logdir
+	logdir=$(dirname "${autodo_eventd_logfile}")
+	[ -d "${logdir}" ] || install -d -m 750 "${logdir}"
+	if ! kldstat -q -m mac_autodo; then
+		warn "mac_autodo kernel module is not loaded"
+		return 1
+	fi
+	if [ ! -c /dev/autodo ]; then
+		warn "/dev/autodo does not exist"
+		return 1
+	fi
+}
+
+run_rc_command "$1"

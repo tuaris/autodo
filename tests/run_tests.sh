@@ -166,9 +166,15 @@ fi
 doas sysctl security.mac.autodo.scope=all >/dev/null
 assert_success "cat $TEST_FILE" "full access restored with scope=all"
 
+# --- Test: Character device ---
+echo ""
+echo "[10] Character device (/dev/autodo)"
+assert_success "test -c /dev/autodo" "/dev/autodo exists"
+assert_success "test -r /dev/autodo" "/dev/autodo readable by wheel"
+
 # --- Test: Module unload ---
 echo ""
-echo "[10] Module unload"
+echo "[11] Module unload"
 doas kldunload mac_autodo
 assert_success "! kldstat -q -m mac_autodo" "module unloaded"
 assert_fail "cat $TEST_FILE" "access denied after unload"

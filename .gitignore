@@ -8,3 +8,7 @@ machine
 x86
 i386
 opt_global.h
+
+# Zig build artifacts
+daemon/zig-out/
+daemon/.zig-cache/

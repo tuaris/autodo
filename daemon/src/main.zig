@@ -3,6 +3,7 @@ const ucl = @import("ucl");
 const posix = std.posix;
 
 const AUTODO_BITMAP_WORDS = 11;
+const AUTODO_MAX_GROUPS = 16;
 const AUTODO_RING_SIZE = 1024;
 
 const AutodoEvent = extern struct {
@@ -20,12 +21,28 @@ const AutodoScope = extern struct {
     as_bitmap: [AUTODO_BITMAP_WORDS]u64,
 };
 
+const AutodoPolicyEntry = extern struct {
+    ape_gid: u32,
+    ape_pad: u32,
+    ape_bitmap: [AUTODO_BITMAP_WORDS]u64,
+};
+
+const AutodoPolicy = extern struct {
+    ap_count: u32,
+    ap_pad: u32,
+    ap_entries: [AUTODO_MAX_GROUPS]AutodoPolicyEntry,
+};
+
 const AUTODO_SET_SCOPE: c_ulong = 0x80584101; // _IOW('A', 1, struct autodo_scope)  88 bytes
 const AUTODO_GET_SCOPE: c_ulong = 0x40584102; // _IOR('A', 2, struct autodo_scope)
 const AUTODO_FLUSH: c_ulong = 0x20004103; // _IO('A', 3)
+// _IOW('A', 4, struct autodo_policy) — sizeof = 8 + 16*96 = 1544 = 0x608
+const AUTODO_SET_POLICY: c_ulong = 0x86084104;
+const AUTODO_GET_POLICY: c_ulong = 0x46084105;
 
 const default_config_path = "/usr/local/etc/autodo/autodo.conf";
 const default_log_path = "/var/log/autodo/events.json";
+const default_template_dir = "/usr/local/etc/autodo/templates";
 const dev_path = "/dev/autodo";
 
 const PrivCategory = struct {
@@ -49,6 +66,90 @@ const priv_categories = [_]PrivCategory{
     .{ .name = "misc", .start = 550, .end = 702 },
 };
 
+const PrivMapping = struct {
+    name: []const u8,
+    value: u16,
+};
+
+const priv_names = [_]PrivMapping{
+    .{ .name = "PRIV_ACCT", .value = 2 },
+    .{ .name = "PRIV_MAXFILES", .value = 3 },
+    .{ .name = "PRIV_MAXPROC", .value = 4 },
+    .{ .name = "PRIV_KTRACE", .value = 5 },
+    .{ .name = "PRIV_CLOCK_SETTIME", .value = 6 },
+    .{ .name = "PRIV_NFSD", .value = 7 },
+    .{ .name = "PRIV_ADJTIME", .value = 10 },
+    .{ .name = "PRIV_NTP_ADJTIME", .value = 11 },
+    .{ .name = "PRIV_SETHOSTNAME", .value = 14 },
+    .{ .name = "PRIV_SETHOSTID", .value = 15 },
+    .{ .name = "PRIV_SETDOMAINNAME", .value = 16 },
+    .{ .name = "PRIV_REBOOT", .value = 18 },
+    .{ .name = "PRIV_AUDIT_CONTROL", .value = 40 },
+    .{ .name = "PRIV_AUDIT_GETAUDIT", .value = 41 },
+    .{ .name = "PRIV_AUDIT_SETAUDIT", .value = 42 },
+    .{ .name = "PRIV_AUDIT_SUBMIT", .value = 43 },
+    .{ .name = "PRIV_CRED_SETUID", .value = 50 },
+    .{ .name = "PRIV_CRED_SETEUID", .value = 51 },
+    .{ .name = "PRIV_CRED_SETGID", .value = 52 },
+    .{ .name = "PRIV_CRED_SETEGID", .value = 53 },
+    .{ .name = "PRIV_CRED_SETGROUPS", .value = 54 },
+    .{ .name = "PRIV_CRED_SETREUID", .value = 55 },
+    .{ .name = "PRIV_CRED_SETREGID", .value = 56 },
+    .{ .name = "PRIV_CRED_SETRESUID", .value = 57 },
+    .{ .name = "PRIV_CRED_SETRESGID", .value = 58 },
+    .{ .name = "PRIV_DEBUG_DIFFCRED", .value = 80 },
+    .{ .name = "PRIV_DEBUG_SUGID", .value = 81 },
+    .{ .name = "PRIV_DEBUG_UNPRIV", .value = 82 },
+    .{ .name = "PRIV_DTRACE_KERNEL", .value = 90 },
+    .{ .name = "PRIV_DTRACE_PROC", .value = 91 },
+    .{ .name = "PRIV_DTRACE_USER", .value = 92 },
+    .{ .name = "PRIV_JAIL_ATTACH", .value = 110 },
+    .{ .name = "PRIV_JAIL_SET", .value = 111 },
+    .{ .name = "PRIV_JAIL_REMOVE", .value = 112 },
+    .{ .name = "PRIV_KLD_LOAD", .value = 130 },
+    .{ .name = "PRIV_KLD_UNLOAD", .value = 131 },
+    .{ .name = "PRIV_MAC_PARTITION", .value = 140 },
+    .{ .name = "PRIV_MAC_PRIVS", .value = 141 },
+    .{ .name = "PRIV_PROC_LIMIT", .value = 160 },
+    .{ .name = "PRIV_PROC_SETLOGIN", .value = 161 },
+    .{ .name = "PRIV_PROC_SETRLIMIT", .value = 162 },
+    .{ .name = "PRIV_SIGNAL_DIFFCRED", .value = 200 },
+    .{ .name = "PRIV_SIGNAL_SUGID", .value = 201 },
+    .{ .name = "PRIV_SYSCTL_WRITE", .value = 220 },
+    .{ .name = "PRIV_SYSCTL_WRITEJAIL", .value = 221 },
+    .{ .name = "PRIV_VFS_READ", .value = 310 },
+    .{ .name = "PRIV_VFS_WRITE", .value = 311 },
+    .{ .name = "PRIV_VFS_ADMIN", .value = 312 },
+    .{ .name = "PRIV_VFS_EXEC", .value = 313 },
+    .{ .name = "PRIV_VFS_LOOKUP", .value = 314 },
+    .{ .name = "PRIV_VFS_CHFLAGS_DEV", .value = 315 },
+    .{ .name = "PRIV_VFS_CHOWN", .value = 316 },
+    .{ .name = "PRIV_VFS_CHROOT", .value = 317 },
+    .{ .name = "PRIV_VFS_FCHROOT", .value = 319 },
+    .{ .name = "PRIV_VFS_LINK", .value = 320 },
+    .{ .name = "PRIV_VFS_MOUNT", .value = 323 },
+    .{ .name = "PRIV_VFS_UNMOUNT", .value = 325 },
+    .{ .name = "PRIV_VFS_SETGID", .value = 327 },
+    .{ .name = "PRIV_VFS_STICKYDIR", .value = 329 },
+    .{ .name = "PRIV_VFS_STAT", .value = 331 },
+    .{ .name = "PRIV_VM_MLOCK", .value = 360 },
+    .{ .name = "PRIV_VM_MUNLOCK", .value = 361 },
+    .{ .name = "PRIV_DEVFS_RULE", .value = 370 },
+    .{ .name = "PRIV_NET_BRIDGE", .value = 390 },
+    .{ .name = "PRIV_NET_RAW", .value = 400 },
+    .{ .name = "PRIV_NET_ROUTE", .value = 410 },
+    .{ .name = "PRIV_NETINET_RAW", .value = 430 },
+    .{ .name = "PRIV_KMEM_READ", .value = 550 },
+    .{ .name = "PRIV_KMEM_WRITE", .value = 551 },
+};
+
+fn lookupPrivByName(name: []const u8) ?u16 {
+    for (priv_names) |pm| {
+        if (std.mem.eql(u8, name, pm.name)) return pm.value;
+    }
+    return null;
+}
+
 fn buildBitmap(categories: []const []const u8) AutodoScope {
     var scope = AutodoScope{ .as_bitmap = [_]u64{0} ** AUTODO_BITMAP_WORDS };
 
@@ -71,6 +172,14 @@ fn buildBitmap(categories: []const []const u8) AutodoScope {
     return scope;
 }
 
+fn clearPrivBit(bitmap: *[AUTODO_BITMAP_WORDS]u64, priv: u16) void {
+    const word = @as(usize, priv) / 64;
+    const bit: u6 = @intCast(@as(usize, priv) % 64);
+    if (word < AUTODO_BITMAP_WORDS) {
+        bitmap[word] &= ~(@as(u64, 1) << bit);
+    }
+}
+
 extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
 
 fn pushScope(dev_fd: posix.fd_t, scope: *AutodoScope) !void {
@@ -78,13 +187,37 @@ fn pushScope(dev_fd: posix.fd_t, scope: *AutodoScope) !void {
     if (rc < 0) return error.IoctlFailed;
 }
 
+fn pushPolicy(dev_fd: posix.fd_t, policy: *AutodoPolicy) !void {
+    const rc = ioctl(dev_fd, AUTODO_SET_POLICY, @as(*anyopaque, @ptrCast(policy)));
+    if (rc < 0) return error.IoctlFailed;
+}
+
+const c_grp = @cImport({
+    @cInclude("grp.h");
+});
+
+fn resolveGroupGid(name: [*:0]const u8) ?u32 {
+    const gr = c_grp.getgrnam(name);
+    if (gr == null) return null;
+    return gr.*.gr_gid;
+}
+
+const GroupEntry = struct {
+    gid: u32,
+    bitmap: [AUTODO_BITMAP_WORDS]u64,
+};
+
 const Config = struct {
     enabled: bool = true,
     categories: [12][]const u8 = undefined,
     num_categories: usize = 0,
     audit_enabled: bool = true,
     log_file: []const u8 = default_log_path,
+    template_dir: []const u8 = default_template_dir,
     all: bool = true,
+    groups: [AUTODO_MAX_GROUPS]GroupEntry = undefined,
+    num_groups: usize = 0,
+    has_groups: bool = false,
 
     fn setAll(self: *Config) void {
         self.all = true;
@@ -92,6 +225,104 @@ const Config = struct {
         self.categories[0] = "all";
     }
 };
+
+fn loadTemplate(template_dir: []const u8, name: []const u8) ?AutodoScope {
+    var path_buf: [256]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.conf", .{ template_dir, name }) catch return null;
+    // Null-terminate for C API
+    if (path.len >= path_buf.len) return null;
+    path_buf[path.len] = 0;
+    const path_z: [*:0]const u8 = path_buf[0..path.len :0];
+
+    const parser = ucl.Parser.init(0) orelse return null;
+    defer parser.deinit();
+
+    if (!parser.addFile(path_z)) return null;
+
+    const root = parser.getObject() orelse return null;
+    defer ucl.unref(root);
+
+    var cats: [12][]const u8 = undefined;
+    var num_cats: usize = 0;
+
+    if (root.lookup("scope")) |scope_obj| {
+        if (scope_obj.lookup("categories")) |cats_arr| {
+            var it = cats_arr.iterate();
+            while (it.next()) |item| {
+                if (num_cats >= 12) break;
+                if (item.toString()) |s| {
+                    cats[num_cats] = s;
+                    num_cats += 1;
+                }
+            }
+        }
+    }
+
+    if (num_cats == 0) {
+        cats[0] = "all";
+        num_cats = 1;
+    }
+
+    var scope = buildBitmap(cats[0..num_cats]);
+
+    // Apply deny list
+    if (root.lookup("deny")) |deny_obj| {
+        if (deny_obj.lookup("privileges")) |privs| {
+            var it = privs.iterate();
+            while (it.next()) |item| {
+                if (item.toString()) |s| {
+                    if (lookupPrivByName(s)) |pval| {
+                        clearPrivBit(&scope.as_bitmap, pval);
+                    } else {
+                        log(.warn, "unknown privilege in deny: {s}", .{s});
+                    }
+                }
+            }
+        }
+    }
+
+    return scope;
+}
+
+fn parseScopeAndDeny(obj: ucl.Object) AutodoScope {
+    var cats: [12][]const u8 = undefined;
+    var num_cats: usize = 0;
+
+    if (obj.lookup("scope")) |scope_obj| {
+        if (scope_obj.lookup("categories")) |cats_arr| {
+            var it = cats_arr.iterate();
+            while (it.next()) |item| {
+                if (num_cats >= 12) break;
+                if (item.toString()) |s| {
+                    cats[num_cats] = s;
+                    num_cats += 1;
+                }
+            }
+        }
+    }
+
+    if (num_cats == 0) {
+        cats[0] = "all";
+        num_cats = 1;
+    }
+
+    var scope = buildBitmap(cats[0..num_cats]);
+
+    if (obj.lookup("deny")) |deny_obj| {
+        if (deny_obj.lookup("privileges")) |privs| {
+            var it = privs.iterate();
+            while (it.next()) |item| {
+                if (item.toString()) |s| {
+                    if (lookupPrivByName(s)) |pval| {
+                        clearPrivBit(&scope.as_bitmap, pval);
+                    }
+                }
+            }
+        }
+    }
+
+    return scope;
+}
 
 fn loadConfig(path: [*:0]const u8) ?Config {
     const parser = ucl.Parser.init(0) orelse return null;
@@ -114,22 +345,78 @@ fn loadConfig(path: [*:0]const u8) ?Config {
         cfg.enabled = obj.toBool();
     }
 
-    if (root.lookup("scope")) |scope_obj| {
-        if (scope_obj.objectType() == .string) {
-            const val = scope_obj.toString() orelse "all";
-            if (std.mem.eql(u8, val, "all")) {
-                cfg.setAll();
+    // Template directory override
+    if (root.lookup("template_dir")) |obj| {
+        if (obj.toString()) |s| {
+            cfg.template_dir = s;
+        }
+    }
+
+    // Multi-group policy: groups { wheel { ... }; developers { ... }; }
+    if (root.lookup("groups")) |groups_obj| {
+        var git = groups_obj.iterate();
+        while (git.next()) |group_obj| {
+            if (cfg.num_groups >= AUTODO_MAX_GROUPS) break;
+            const group_name = group_obj.key() orelse continue;
+
+            // Null-terminate group name for getgrnam
+            var name_buf: [64]u8 = undefined;
+            if (group_name.len >= name_buf.len) continue;
+            @memcpy(name_buf[0..group_name.len], group_name);
+            name_buf[group_name.len] = 0;
+            const name_z: [*:0]const u8 = name_buf[0..group_name.len :0];
+
+            const gid = resolveGroupGid(name_z) orelse {
+                log(.warn, "unknown group: {s}", .{group_name});
+                continue;
+            };
+
+            // Determine scope: template reference or inline scope/deny
+            var bitmap: [AUTODO_BITMAP_WORDS]u64 = undefined;
+            if (group_obj.lookup("template")) |tmpl_obj| {
+                if (tmpl_obj.toString()) |tmpl_name| {
+                    if (loadTemplate(cfg.template_dir, tmpl_name)) |scope| {
+                        bitmap = scope.as_bitmap;
+                    } else {
+                        log(.warn, "template not found: {s}", .{tmpl_name});
+                        continue;
+                    }
+                } else continue;
+            } else {
+                // Inline scope + deny
+                const scope = parseScopeAndDeny(group_obj);
+                bitmap = scope.as_bitmap;
             }
-        } else if (scope_obj.objectType() == .object) {
-            if (scope_obj.lookup("categories")) |cats| {
-                var it = cats.iterate();
-                cfg.num_categories = 0;
-                cfg.all = false;
-                while (it.next()) |item| {
-                    if (cfg.num_categories >= 12) break;
-                    if (item.toString()) |s| {
-                        cfg.categories[cfg.num_categories] = s;
-                        cfg.num_categories += 1;
+
+            cfg.groups[cfg.num_groups] = GroupEntry{
+                .gid = gid,
+                .bitmap = bitmap,
+            };
+            cfg.num_groups += 1;
+            log(.info, "group {s} (gid={d}): policy loaded", .{ group_name, gid });
+        }
+        cfg.has_groups = cfg.num_groups > 0;
+    }
+
+    // Legacy single-scope (used when no groups block)
+    if (!cfg.has_groups) {
+        if (root.lookup("scope")) |scope_obj| {
+            if (scope_obj.objectType() == .string) {
+                const val = scope_obj.toString() orelse "all";
+                if (std.mem.eql(u8, val, "all")) {
+                    cfg.setAll();
+                }
+            } else if (scope_obj.objectType() == .object) {
+                if (scope_obj.lookup("categories")) |cats| {
+                    var it = cats.iterate();
+                    cfg.num_categories = 0;
+                    cfg.all = false;
+                    while (it.next()) |item| {
+                        if (cfg.num_categories >= 12) break;
+                        if (item.toString()) |s| {
+                            cfg.categories[cfg.num_categories] = s;
+                            cfg.num_categories += 1;
+                        }
                     }
                 }
             }
@@ -196,6 +483,47 @@ fn makeKevent(ident: usize, filter: c_short, flags: c_ushort, fflags: c_uint) KE
     };
 }
 
+fn applyConfig(dev_fd: posix.fd_t, cfg: *const Config) void {
+    if (!cfg.enabled) {
+        // Disabled: push empty policy (clears all grants)
+        var policy = std.mem.zeroes(AutodoPolicy);
+        policy.ap_count = 0;
+        pushPolicy(dev_fd, &policy) catch {
+            // Fallback to legacy empty scope
+            var scope = AutodoScope{ .as_bitmap = [_]u64{0} ** AUTODO_BITMAP_WORDS };
+            pushScope(dev_fd, &scope) catch {
+                log(.err, "failed to push disabled scope", .{});
+            };
+        };
+        log(.info, "module disabled via config", .{});
+        return;
+    }
+
+    if (cfg.has_groups) {
+        // Multi-group policy path
+        var policy = std.mem.zeroes(AutodoPolicy);
+        policy.ap_count = @intCast(cfg.num_groups);
+        for (0..cfg.num_groups) |i| {
+            policy.ap_entries[i].ape_gid = cfg.groups[i].gid;
+            policy.ap_entries[i].ape_pad = 0;
+            policy.ap_entries[i].ape_bitmap = cfg.groups[i].bitmap;
+        }
+        pushPolicy(dev_fd, &policy) catch {
+            log(.err, "ioctl SET_POLICY failed", .{});
+            return;
+        };
+        log(.info, "pushed multi-group policy ({d} groups)", .{cfg.num_groups});
+    } else {
+        // Legacy single-scope path
+        var scope = buildBitmap(cfg.categories[0..cfg.num_categories]);
+        pushScope(dev_fd, &scope) catch {
+            log(.err, "ioctl SET_SCOPE failed", .{});
+            return;
+        };
+        log(.info, "pushed legacy scope bitmap", .{});
+    }
+}
+
 pub fn main() !void {
     var config_path: [*:0]const u8 = default_config_path;
     var log_path: []const u8 = default_log_path;
@@ -220,21 +548,6 @@ pub fn main() !void {
         }
     }
 
-    // Load config
-    var scope = AutodoScope{ .as_bitmap = [_]u64{~@as(u64, 0)} ** AUTODO_BITMAP_WORDS };
-    if (loadConfig(config_path)) |cfg| {
-        log(.info, "loaded config from {s}", .{config_path});
-        if (!cfg.enabled) {
-            // Push empty bitmap
-            scope = AutodoScope{ .as_bitmap = [_]u64{0} ** AUTODO_BITMAP_WORDS };
-        } else {
-            scope = buildBitmap(cfg.categories[0..cfg.num_categories]);
-        }
-        log_path = cfg.log_file;
-    } else {
-        log(.warn, "no config at {s}, using defaults (scope=all)", .{config_path});
-    }
-
     // Open /dev/autodo
     const dev_fd = posix.open(dev_path, .{ .ACCMODE = .RDWR }, 0) catch |err| {
         log(.err, "cannot open {s}: {s}", .{ dev_path, @errorName(err) });
@@ -242,12 +555,19 @@ pub fn main() !void {
     };
     defer posix.close(dev_fd);
 
-    // Push scope to kernel
-    pushScope(dev_fd, &scope) catch |err| {
-        log(.err, "ioctl SET_SCOPE failed: {s}", .{@errorName(err)});
-        return err;
-    };
-    log(.info, "pushed scope bitmap to kernel", .{});
+    // Load and apply config
+    if (loadConfig(config_path)) |cfg| {
+        log(.info, "loaded config from {s}", .{config_path});
+        applyConfig(dev_fd, &cfg);
+        log_path = cfg.log_file;
+    } else {
+        log(.warn, "no config at {s}, using defaults (scope=all)", .{config_path});
+        var scope = AutodoScope{ .as_bitmap = [_]u64{~@as(u64, 0)} ** AUTODO_BITMAP_WORDS };
+        pushScope(dev_fd, &scope) catch |err| {
+            log(.err, "ioctl SET_SCOPE failed: {s}", .{@errorName(err)});
+            return err;
+        };
+    }
 
     // Open config file fd for vnode monitoring
     const config_fd = posix.open(
@@ -361,15 +681,8 @@ pub fn main() !void {
                 } else if (ev.ident == 1) {
                     log(.info, "received SIGHUP, reloading config", .{});
                     if (loadConfig(config_path)) |cfg| {
-                        if (!cfg.enabled) {
-                            scope = AutodoScope{ .as_bitmap = [_]u64{0} ** AUTODO_BITMAP_WORDS };
-                        } else {
-                            scope = buildBitmap(cfg.categories[0..cfg.num_categories]);
-                        }
-                        pushScope(dev_fd, &scope) catch {
-                            log(.err, "ioctl SET_SCOPE failed on reload", .{});
-                        };
-                        log(.info, "config reloaded, scope pushed", .{});
+                        applyConfig(dev_fd, &cfg);
+                        log(.info, "config reloaded via SIGHUP", .{});
                     } else {
                         log(.err, "config reload failed", .{});
                     }
@@ -377,14 +690,7 @@ pub fn main() !void {
             } else if (ev.filter == c_event.EVFILT_VNODE) {
                 log(.info, "config file changed, reloading", .{});
                 if (loadConfig(config_path)) |cfg| {
-                    if (!cfg.enabled) {
-                        scope = AutodoScope{ .as_bitmap = [_]u64{0} ** AUTODO_BITMAP_WORDS };
-                    } else {
-                        scope = buildBitmap(cfg.categories[0..cfg.num_categories]);
-                    }
-                    pushScope(dev_fd, &scope) catch {
-                        log(.err, "ioctl SET_SCOPE failed on reload", .{});
-                    };
+                    applyConfig(dev_fd, &cfg);
                     log(.info, "config reloaded via file change", .{});
                 }
             } else if (ev.filter == c_event.EVFILT_READ) {

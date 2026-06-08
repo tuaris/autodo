@@ -67,6 +67,15 @@
 
 static volatile uint64_t autodo_scope_bitmap[AUTODO_BITMAP_WORDS];
 
+/*
+ * Multi-group policy.
+ * When autodo_policy_count > 0, priv_grant uses per-GID bitmaps.
+ * When autodo_policy_count == 0, falls back to legacy single-GID behavior.
+ * The policy array is updated atomically by the daemon via ioctl.
+ */
+static struct autodo_policy_entry autodo_policy_entries[AUTODO_MAX_GROUPS];
+static volatile int autodo_policy_count;	/* 0 = legacy mode */
+
 static inline int
 autodo_priv_in_scope(int priv)
 {
@@ -463,6 +472,35 @@ autodo_dev_ioctl(struct cdev *dev __unused, u_long cmd, caddr_t data,
 		mtx_unlock(&autodo_ring_mtx);
 		return (0);
 
+	case AUTODO_SET_POLICY: {
+		struct autodo_policy *pol = (struct autodo_policy *)data;
+		if (pol->ap_count > AUTODO_MAX_GROUPS)
+			return (EINVAL);
+		/*
+		 * Write entries first, then publish count.
+		 * Readers see count via volatile read; entries
+		 * are stable by the time count is visible.
+		 */
+		for (i = 0; i < (int)pol->ap_count; i++)
+			autodo_policy_entries[i] = pol->ap_entries[i];
+		atomic_thread_fence_rel();
+		autodo_policy_count = (int)pol->ap_count;
+		return (0);
+	}
+
+	case AUTODO_GET_POLICY: {
+		struct autodo_policy *pol = (struct autodo_policy *)data;
+		int cnt = autodo_policy_count;
+		pol->ap_count = (uint32_t)cnt;
+		pol->ap_pad = 0;
+		for (i = 0; i < cnt && i < AUTODO_MAX_GROUPS; i++)
+			pol->ap_entries[i] = autodo_policy_entries[i];
+		for (; i < AUTODO_MAX_GROUPS; i++)
+			memset(&pol->ap_entries[i], 0,
+			    sizeof(pol->ap_entries[i]));
+		return (0);
+	}
+
 	default:
 		return (ENOTTY);
 	}
@@ -660,6 +698,21 @@ autodo_cred_has_gid(struct ucred *cred, gid_t gid)
 }
 
 /*
+ * Check if a privilege is set in a specific bitmap.
+ */
+static inline int
+autodo_priv_in_bitmap(const uint64_t *bitmap, int priv)
+{
+	unsigned word, bit;
+
+	if (priv <= 0 || priv >= AUTODO_BITMAP_BITS)
+		return (0);
+	word = (unsigned)priv / 64;
+	bit = (unsigned)priv % 64;
+	return ((bitmap[word] >> bit) & 1);
+}
+
+/*
  * MAC hook: mac_priv_grant
  *
  * Called when the kernel is about to deny a privilege.  Returning 0 grants
@@ -670,18 +723,9 @@ static int
 autodo_priv_grant(struct ucred *cred, int priv)
 {
 	struct prison *pr;
+	int policy_count;
 
 	if (!autodo_enabled)
-		return (EPERM);
-
-	if (!autodo_cred_has_gid(cred, (gid_t)autodo_gid))
-		return (EPERM);
-
-	/*
-	 * Check privilege scope bitmap.  If the privilege is not in the
-	 * configured scope, deny it regardless of group membership.
-	 */
-	if (!autodo_priv_in_scope(priv))
 		return (EPERM);
 
 	/*
@@ -693,6 +737,37 @@ autodo_priv_grant(struct ucred *cred, int priv)
 	if (pr != &prison0 && !autodo_jail_enabled(pr))
 		return (EPERM);
 
+	/*
+	 * Multi-group policy path.  When the daemon has pushed a policy
+	 * (policy_count > 0), iterate the entries.  The first group whose
+	 * GID the credential holds and whose bitmap includes the privilege
+	 * wins the grant.  If no entry matches, fall through to deny.
+	 */
+	policy_count = autodo_policy_count;
+	if (policy_count > 0) {
+		int i;
+		for (i = 0; i < policy_count; i++) {
+			if (!autodo_cred_has_gid(cred,
+			    autodo_policy_entries[i].ape_gid))
+				continue;
+			if (!autodo_priv_in_bitmap(
+			    autodo_policy_entries[i].ape_bitmap, priv))
+				goto denied_by_scope;
+			goto granted;
+		}
+		return (EPERM);
+	}
+
+	/*
+	 * Legacy single-GID path (no daemon, manual sysctl use).
+	 */
+	if (!autodo_cred_has_gid(cred, (gid_t)autodo_gid))
+		return (EPERM);
+
+	if (!autodo_priv_in_scope(priv))
+		goto denied_by_scope;
+
+granted:
 	atomic_add_long(&autodo_grant_count, 1);
 
 	if (autodo_log_grants) {
@@ -705,6 +780,11 @@ autodo_priv_grant(struct ucred *cred, int priv)
 	}
 
 	return (0);
+
+denied_by_scope:
+	if (autodo_log_grants)
+		autodo_emit_event(cred, priv, 0);
+	return (EPERM);
 }
 
 static void
@@ -714,6 +794,7 @@ autodo_init(struct mac_policy_conf *mpc __unused)
 
 	/* Initialize scope bitmap to "all" (default). */
 	autodo_bitmap_fill(autodo_scope_bitmap);
+	autodo_policy_count = 0;
 
 	/* Initialize ring buffer and chardev. */
 	mtx_init(&autodo_ring_mtx, "autodo ring", NULL, MTX_DEF);

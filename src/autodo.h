@@ -40,21 +40,45 @@ struct autodo_event {
 };	/* 48 bytes total */
 
 /*
- * Scope bitmap for ioctl.
+ * Scope bitmap for ioctl (legacy single-group interface).
  */
 struct autodo_scope {
 	uint64_t	as_bitmap[AUTODO_BITMAP_WORDS];
 };
 
 /*
+ * Multi-group policy.
+ * Each entry maps a GID to a privilege bitmap.
+ * The daemon resolves group names, compiles templates/deny lists
+ * into bitmaps, and pushes the whole policy to the kernel.
+ */
+#define	AUTODO_MAX_GROUPS	16
+
+struct autodo_policy_entry {
+	uint32_t	ape_gid;
+	uint32_t	ape_pad;
+	uint64_t	ape_bitmap[AUTODO_BITMAP_WORDS];
+};
+
+struct autodo_policy {
+	uint32_t	ap_count;		/* active entries (0..16) */
+	uint32_t	ap_pad;
+	struct autodo_policy_entry ap_entries[AUTODO_MAX_GROUPS];
+};
+
+/*
  * ioctl commands on /dev/autodo.
  *
- * AUTODO_SET_SCOPE  — push a compiled privilege bitmap from daemon to kernel
- * AUTODO_GET_SCOPE  — read the current privilege bitmap
+ * AUTODO_SET_SCOPE  — push a compiled privilege bitmap (legacy single-group)
+ * AUTODO_GET_SCOPE  — read the current privilege bitmap (legacy)
  * AUTODO_FLUSH      — discard all pending events in the ring buffer
+ * AUTODO_SET_POLICY — push a multi-group policy from daemon to kernel
+ * AUTODO_GET_POLICY — read the current multi-group policy
  */
 #define	AUTODO_SET_SCOPE	_IOW('A', 1, struct autodo_scope)
 #define	AUTODO_GET_SCOPE	_IOR('A', 2, struct autodo_scope)
 #define	AUTODO_FLUSH		_IO('A', 3)
+#define	AUTODO_SET_POLICY	_IOW('A', 4, struct autodo_policy)
+#define	AUTODO_GET_POLICY	_IOR('A', 5, struct autodo_policy)
 
 #endif /* _AUTODO_H_ */

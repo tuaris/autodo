@@ -1,10 +1,37 @@
 enabled = true;
 
-scope {
-    categories = ["all"];
+# Multi-group policy.
+# Each group key is resolved to a GID via getgrnam(3).
+# Use "template" to reference /usr/local/etc/autodo/templates/<name>.conf,
+# or define inline scope/deny blocks.
+groups {
+    wheel {
+        template = "all";
+    }
+    # developers {
+    #     template = "developer";
+    # }
+    # operators {
+    #     template = "server-admin";
+    # }
+    # restricted {
+    #     scope {
+    #         categories = ["vfs"];
+    #     }
+    #     deny {
+    #         privileges = ["PRIV_VFS_MOUNT", "PRIV_VFS_UNMOUNT"];
+    #     }
+    # }
 }
+
+# Legacy single-scope mode (used when "groups" block is absent).
+# scope {
+#     categories = ["all"];
+# }
 
 audit {
     enabled = true;
     log_file = "/var/log/autodo/events.json";
 }
+
+# template_dir = "/usr/local/etc/autodo/templates";

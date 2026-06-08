@@ -651,22 +651,19 @@ pub fn main() !void {
     _ = sigaddset(&mask, 1); // SIGHUP
     _ = std.c.sigprocmask(std.c.SIG.BLOCK, &mask, null);
 
-    // Register changelist
-    const rc = kevent(kq, &changes, nchanges, null, 0, null);
-    if (rc < 0) {
-        const errno_val = std.c._errno().*;
-        log(.err, "kevent register failed, errno={d}", .{errno_val});
-        return error.KeventFailed;
-    }
-
     log(.info, "event loop started, monitoring {s}", .{dev_path});
 
     var running = true;
     var events: [16]KEvent = undefined;
     var buf: [4096]u8 align(@alignOf(AutodoEvent)) = undefined;
+    var reg_changes: ?[*]const KEvent = &changes;
+    var reg_nchanges: c_int = nchanges;
 
     while (running) {
-        const nevents = kevent(kq, null, 0, &events, 16, null);
+        const nevents = kevent(kq, reg_changes, reg_nchanges, &events, 16, null);
+        // After first call, changelist is consumed — clear for subsequent iterations
+        reg_changes = null;
+        reg_nchanges = 0;
         if (nevents < 0) {
             const err = std.c._errno().*;
             if (err != 4) // EINTR

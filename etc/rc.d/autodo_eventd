@@ -26,9 +26,10 @@ load_rc_config $name
 : ${autodo_eventd_config:="/usr/local/etc/autodo/autodo.conf"}
 : ${autodo_eventd_logfile:="/var/log/autodo/events.json"}
 
+procname="/usr/local/bin/autodo-eventd"
 pidfile="/var/run/${name}.pid"
 command="/usr/sbin/daemon"
-command_args="-p ${pidfile} -S -T ${name} -- /usr/local/bin/autodo-eventd --config=${autodo_eventd_config} --log=${autodo_eventd_logfile}"
+command_args="-p ${pidfile} -S -T ${name} -- ${procname} --config=${autodo_eventd_config} --log=${autodo_eventd_logfile}"
 
 start_precmd="${name}_prestart"
 
